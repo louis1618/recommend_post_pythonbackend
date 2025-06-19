@@ -1,0 +1,15 @@
+# requirements.txt
+fastapi
+uvicorn[standard]
+sqlalchemy
+python-multipart
+numpy
+scikit-learn
+pandas
+redis
+pydantic
+
+# --- 배포용 라이브러리 추가 ---
+gunicorn
+psycopg2-binary
+python-dotenv
