@@ -9,6 +9,7 @@ import redis
 import logging
 import traceback
 import asyncio
+import os
 
 from database import get_db, Post, UserInteraction, UserProfile, PostResponse
 from recommendation_engine import RecommendationEngine
@@ -20,10 +21,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS 설정 (프론트엔드 개발 서버 주소 허용)
+allowed_frontend_origins = [
+    "http://localhost:3000",  # 로컬 개발 환경용
+    "https://recommendsystemapp.vercel.app",
+    "https://lab.ras.louis1618.shop"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=allowed_frontend_origins, # 준비된 리스트를 사용
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -136,9 +142,7 @@ async def get_personalized_feed(
             response_posts.append(p_response)
         
         if redis_client:
-            # Pydantic 모델 리스트를 JSON 문자열로 변환할 때 model_dump(mode='json') 사용
-            # 이는 datetime 객체를 ISO 8601 문자열로 자동 변환하여 JSON 직렬화 가능하게 합니다.
-            final_response_json = json.dumps([p.model_dump(mode='json') for p in response_posts]) # 이 부분을 수정
+            final_response_json = json.dumps([p.model_dump(mode='json') for p in response_posts])
             redis_client.setex(cache_key, 600, final_response_json) # 10분 캐시
             logger.info(f"Cached feed for user: {user_id}, page: {request.page}")
         
@@ -181,14 +185,12 @@ async def track_interaction(
                 interaction_id = interaction.id
                 status_message = "success"
 
-                # 좋아요/취소 시 해당 사용자의 모든 피드 캐시를 무효화
                 if redis_client:
                     keys_to_delete = redis_client.keys(f"feed:{request.user_id}:*")
                     if keys_to_delete:
                         redis_client.delete(*keys_to_delete)
                         logger.info(f"Deleted feed cache for user {request.user_id}: {keys_to_delete}")
                 
-                # 비동기적으로 사용자 프로필 업데이트 (응답 시간에 영향 주지 않음)
                 asyncio.create_task(recommendation_engine.update_user_profile(request.user_id, interaction, db))
                 logger.info(f"User {request.user_id} liked post {request.post_id}.")
 
@@ -196,7 +198,7 @@ async def track_interaction(
             existing_interaction = db.query(UserInteraction).filter(
                 UserInteraction.user_id == request.user_id,
                 UserInteraction.post_id == request.post_id,
-                UserInteraction.interaction_type == 'like' # 'like' 타입 상호작용을 찾아서 삭제
+                UserInteraction.interaction_type == 'like'
             ).first()
             if existing_interaction:
                 db.delete(existing_interaction)
@@ -208,7 +210,6 @@ async def track_interaction(
                 status_message = "unliked"
                 interaction_id = existing_interaction.id
 
-                # 좋아요/취소 시 해당 사용자의 모든 피드 캐시를 무효화
                 if redis_client:
                     keys_to_delete = redis_client.keys(f"feed:{request.user_id}:*")
                     if keys_to_delete:
@@ -219,14 +220,13 @@ async def track_interaction(
                 status_message = "not liked before"
                 logger.info(f"User {request.user_id} tried to unlike post {request.post_id}, but it was not liked before.")
 
-        else: # view, short_view, long_view, detail_view, share 등 기타 상호작용
+        else: 
             interaction = await behavior_tracker.track_interaction(
                 request.user_id, request.post_id, request.interaction_type, request.duration, db
             )
             interaction_id = interaction.id
             status_message = "success"
             
-            # 조회수 관련 상호작용 시에도 캐시를 무효화하여 즉시 반영
             if redis_client:
                 keys_to_delete = redis_client.keys(f"feed:{request.user_id}:*")
                 if keys_to_delete:
@@ -251,9 +251,6 @@ async def get_post_detail(post_id: str, user_id: str, db: Session = Depends(get_
         logger.warning(f"Post {post_id} not found.")
         raise HTTPException(status_code=404, detail="Post not found")
     
-    # 상세 보기 상호작용 추적 (비동기 처리 가능)
-    # 캐시 무효화는 여기서 하지 않음: 상세 보기는 피드 추천에 직접적인 영향을 주지 않으므로
-    # 하지만 사용자 프로필 업데이트는 필요
     interaction = await behavior_tracker.track_interaction(
         user_id, post_id, "detail_view", None, db
     )
@@ -266,7 +263,7 @@ async def get_post_detail(post_id: str, user_id: str, db: Session = Depends(get_
         UserInteraction.interaction_type == 'like'
     ).first() is not None
     
-    post_response = PostFeedResponse.model_validate(post) # from_orm 대신 model_validate 사용
+    post_response = PostFeedResponse.model_validate(post)
     post_response.is_liked = is_liked
     
     return post_response
@@ -287,30 +284,20 @@ async def reset_user_algorithm_data(
     - 해당 사용자의 Redis 캐시 삭제
     """
     try:
-        # 1. UserProfile 삭제 (또는 초기화)
         user_profile = db.query(UserProfile).filter(UserProfile.user_id == request.user_id).first()
         if user_profile:
             db.delete(user_profile)
             logger.info(f"Deleted UserProfile for user: {request.user_id}")
         
-        # 2. UserInteraction 삭제
         db.query(UserInteraction).filter(UserInteraction.user_id == request.user_id).delete()
         db.commit()
         logger.info(f"Deleted all UserInteractions for user: {request.user_id}")
         
-        # 3. 해당 사용자의 Redis 캐시 삭제
         if redis_client:
             keys_to_delete = redis_client.keys(f"feed:{request.user_id}:*")
             if keys_to_delete:
                 redis_client.delete(*keys_to_delete)
                 logger.info(f"Deleted all Redis cache for user: {request.user_id}")
-
-        # 모든 데이터를 삭제한 후, 기본 사용자 프로필을 다시 생성 (선택 사항)
-        # 이렇게 하면 다음 요청 시 profile이 없어서 기본 선호도로 시작합니다.
-        # 필요하다면 여기서 `UserProfile`을 다시 추가할 수 있습니다.
-        # 예를 들어, `init_db.py`에서처럼 기본 프로필을 추가하는 로직을 여기에 포함할 수도 있습니다.
-        # db.add(UserProfile(user_id=request.user_id))
-        # db.commit()
         
         return {"status": "success", "message": f"Algorithm data reset for user: {request.user_id}"}
     except Exception as e:
